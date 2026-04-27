@@ -1,0 +1,1278 @@
+---
+title: "629 interim project"
+author: "Ruicong Peng"
+date: "2026-03-08"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    keep_tex: true
+geometry: margin=1in
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+
+set.seed(629)
+```
+
+
+
+```{r step1-load-clinical-patient, message=FALSE, warning=FALSE}
+
+library(dplyr)
+
+base_url <- "https://media.githubusercontent.com/media/cBioPortal/datahub/refs/heads/master/public/msk_chord_2024"
+
+clinical_patient <- read.delim(
+  paste0(base_url, "/data_clinical_patient.txt"),
+  comment.char = "#",
+  stringsAsFactors = FALSE
+)
+
+clinical_patient <- clinical_patient %>%
+  select(
+    PATIENT_ID,
+    GENDER,
+    CURRENT_AGE_DEID,
+    STAGE_HIGHEST_RECORDED,
+    OS_MONTHS,
+    OS_STATUS
+  ) %>%
+  mutate(
+    os_event = if_else(OS_STATUS == "1:DECEASED", 1L, 0L),
+    age = as.numeric(CURRENT_AGE_DEID),
+    gender = GENDER,
+    stage = STAGE_HIGHEST_RECORDED
+  )
+
+
+dim(clinical_patient)
+
+head(clinical_patient)
+
+summary(clinical_patient$OS_MONTHS)
+
+table(clinical_patient$OS_STATUS)
+
+
+```
+
+```{r step1-check-missing, message=FALSE, warning=FALSE}
+colSums(is.na(clinical_patient[, c("PATIENT_ID", "age", "gender", "stage", "OS_MONTHS", "os_event")]))
+```
+
+
+
+```{r step2-load-merge-clinical-sample, message=FALSE, warning=FALSE}
+
+library(dplyr)
+
+clinical_sample_raw <- read.delim(
+  paste0(base_url, "/data_clinical_sample.txt"),
+  comment.char = "#",
+  stringsAsFactors = FALSE
+)
+
+clinical_sample_raw <- clinical_sample_raw %>%
+  select(
+    SAMPLE_ID,
+    PATIENT_ID,
+    CANCER_TYPE,
+    SAMPLE_TYPE,
+    PRIMARY_SITE,
+    METASTATIC_SITE
+  )
+
+sample_count_check <- clinical_sample_raw %>%
+  count(PATIENT_ID, name = "n_samples")
+
+table(sample_count_check$n_samples)
+
+target_cancer <- "Non-Small Cell Lung Cancer"
+
+
+# Primary > Local Recurrence > Metastasis > Unknown
+clinical_sample_one <- clinical_sample_raw %>%
+  filter(CANCER_TYPE == target_cancer) %>%
+  mutate(
+    sample_type_priority = case_when(
+      SAMPLE_TYPE == "Primary" ~ 1,
+      SAMPLE_TYPE == "Local Recurrence" ~ 2,
+      SAMPLE_TYPE == "Metastasis" ~ 3,
+      SAMPLE_TYPE == "Unknown" ~ 4,
+      TRUE ~ 5
+    )
+  ) %>%
+  arrange(PATIENT_ID, sample_type_priority, SAMPLE_ID) %>%
+  group_by(PATIENT_ID) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(
+    PATIENT_ID,
+    SAMPLE_ID,
+    CANCER_TYPE,
+    SAMPLE_TYPE,
+    PRIMARY_SITE,
+    METASTATIC_SITE
+  )
+
+# Check
+clinical_sample_one %>%
+  count(PATIENT_ID) %>%
+  pull(n) %>%
+  table()
+
+
+analysis_step2 <- clinical_patient %>%
+  inner_join(clinical_sample_one, by = "PATIENT_ID")
+
+
+dim(analysis_step2)
+
+
+head(analysis_step2)
+
+
+table(analysis_step2$SAMPLE_TYPE, useNA = "ifany")
+
+
+analysis_step2 %>%
+  count(PATIENT_ID) %>%
+  summarise(
+    min_n = min(n),
+    max_n = max(n)
+  )
+
+```
+
+```{r step3-4-mutation-feature-engineering, message=FALSE, warning=FALSE}
+
+library(dplyr)
+library(tidyr)
+
+## =========================
+## Confirm NSCLC cohort
+## =========================
+dim(analysis_step2)
+
+table(analysis_step2$CANCER_TYPE, useNA = "ifany")
+
+
+selected_samples <- analysis_step2 %>%
+  select(PATIENT_ID, SAMPLE_ID)
+
+length(unique(selected_samples$PATIENT_ID))
+length(unique(selected_samples$SAMPLE_ID))
+
+
+## =========================
+##  Build genomic mutation indicators
+## =========================
+mut_raw <- read.delim(
+  paste0(base_url, "/data_mutations.txt"),
+  comment.char = "#",
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+
+colnames(mut_raw)
+
+
+mut_nsclc <- mut_raw %>%
+  select(
+    Hugo_Symbol,
+    Tumor_Sample_Barcode,
+    Variant_Classification
+  ) %>%
+  inner_join(
+    selected_samples,
+    by = c("Tumor_Sample_Barcode" = "SAMPLE_ID")
+  )
+
+
+dim(mut_nsclc)
+
+length(unique(mut_nsclc$Tumor_Sample_Barcode))
+length(unique(mut_nsclc$PATIENT_ID))
+
+
+top_genes_tbl <- mut_nsclc %>%
+  distinct(PATIENT_ID, Hugo_Symbol) %>%
+  count(Hugo_Symbol, sort = TRUE)
+
+head(top_genes_tbl, 20)
+
+
+top_n_genes <- 10
+
+top_genes <- top_genes_tbl %>%
+  slice_head(n = top_n_genes) %>%
+  pull(Hugo_Symbol)
+
+top_genes
+
+
+mut_wide <- mut_nsclc %>%
+  filter(Hugo_Symbol %in% top_genes) %>%
+  distinct(PATIENT_ID, Hugo_Symbol) %>%
+  mutate(mutated = 1L) %>%
+  pivot_wider(
+    names_from = Hugo_Symbol,
+    values_from = mutated,
+    values_fill = 0,
+    names_prefix = "mut_"
+  )
+
+
+dim(mut_wide)
+head(mut_wide)
+
+
+analysis_step4 <- analysis_step2 %>%
+  left_join(mut_wide, by = "PATIENT_ID")
+
+
+mutation_cols <- grep("^mut_", names(analysis_step4), value = TRUE)
+
+analysis_step4 <- analysis_step4 %>%
+  mutate(
+    across(all_of(mutation_cols), ~ ifelse(is.na(.x), 0L, .x))
+  )
+
+
+dim(analysis_step4)
+
+head(analysis_step4)
+
+
+analysis_step4 %>%
+  summarise(across(all_of(mutation_cols), sum))
+
+
+analysis_step4 %>%
+  count(PATIENT_ID) %>%
+  summarise(
+    min_n = min(n),
+    max_n = max(n)
+  )
+
+```
+
+
+```{r step5-6-nlp-features-final-dataset, message=FALSE, warning=FALSE}
+
+library(dplyr)
+library(tidyr)
+
+## =========================
+## Progression features
+## Baseline-only: use scans at or before sequencing
+## =========================
+progression_raw <- read.delim(
+  paste0(base_url, "/data_timeline_progression.txt"),
+  comment.char = "#",
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+progression_nsclc <- progression_raw %>%
+  semi_join(analysis_step4 %>% select(PATIENT_ID), by = "PATIENT_ID") %>%
+  filter(START_DATE <= 0) %>%   
+  select(PATIENT_ID, START_DATE, NLP_PROGRESSION_PROBABILITY, PROCEDURE_TYPE)
+
+
+progression_features <- progression_nsclc %>%
+  group_by(PATIENT_ID) %>%
+  summarise(
+    n_scans_progression = n(),
+    progression_prob_mean = mean(NLP_PROGRESSION_PROBABILITY, na.rm = TRUE),
+    progression_prob_max  = max(NLP_PROGRESSION_PROBABILITY, na.rm = TRUE),
+    progression_prob_min  = min(NLP_PROGRESSION_PROBABILITY, na.rm = TRUE),
+    progression_prob_sd   = sd(NLP_PROGRESSION_PROBABILITY, na.rm = TRUE),
+    last_progression_prob = NLP_PROGRESSION_PROBABILITY[which.max(START_DATE)],
+    .groups = "drop"
+  )
+
+# NaN / Inf / -Inf
+progression_features <- progression_features %>%
+  mutate(across(where(is.numeric), ~ replace(., is.nan(.), NA))) %>%
+  mutate(across(where(is.numeric), ~ replace(., is.infinite(.), NA))) %>%
+  mutate(across(where(is.numeric), ~ replace_na(., 0)))
+
+dim(progression_features)
+head(progression_features)
+
+
+## =========================
+## Tumor site features
+## Baseline-only: use scans at or before sequencing
+## =========================
+tumor_sites_raw <- read.delim(
+  paste0(base_url, "/data_timeline_tumor_sites.txt"),
+  comment.char = "#",
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+tumor_sites_nsclc <- tumor_sites_raw %>%
+  semi_join(analysis_step4 %>% select(PATIENT_ID), by = "PATIENT_ID") %>%
+  filter(START_DATE <= 0) %>%   
+  select(
+    PATIENT_ID,
+    START_DATE,
+    SOURCE_SPECIFIC,
+    TUMOR_SITE,
+    CHEST,
+    ABDOMEN,
+    PELVIS,
+    HEAD,
+    OTHER
+  )
+
+
+scan_level_sites <- tumor_sites_nsclc %>%
+  group_by(PATIENT_ID, START_DATE, SOURCE_SPECIFIC) %>%
+  summarise(
+    n_sites_this_scan = n_distinct(TUMOR_SITE),
+    has_chest   = as.integer(any(CHEST == 1, na.rm = TRUE)),
+    has_abdomen = as.integer(any(ABDOMEN == 1, na.rm = TRUE)),
+    has_pelvis  = as.integer(any(PELVIS == 1, na.rm = TRUE)),
+    has_head    = as.integer(any(HEAD == 1, na.rm = TRUE)),
+    has_other   = as.integer(any(OTHER == 1, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+# patient-level
+tumor_site_features <- scan_level_sites %>%
+  group_by(PATIENT_ID) %>%
+  summarise(
+    n_scans_sites = n(),
+    tumor_sites_mean = mean(n_sites_this_scan, na.rm = TRUE),
+    tumor_sites_max  = max(n_sites_this_scan, na.rm = TRUE),
+    tumor_sites_min  = min(n_sites_this_scan, na.rm = TRUE),
+    prop_scans_chest   = mean(has_chest, na.rm = TRUE),
+    prop_scans_abdomen = mean(has_abdomen, na.rm = TRUE),
+    prop_scans_pelvis  = mean(has_pelvis, na.rm = TRUE),
+    prop_scans_head    = mean(has_head, na.rm = TRUE),
+    prop_scans_other   = mean(has_other, na.rm = TRUE),
+    any_head_site    = as.integer(any(has_head == 1, na.rm = TRUE)),
+    any_abdomen_site = as.integer(any(has_abdomen == 1, na.rm = TRUE)),
+    any_pelvis_site  = as.integer(any(has_pelvis == 1, na.rm = TRUE)),
+    any_other_site   = as.integer(any(has_other == 1, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+# NaN / Inf / -Inf
+tumor_site_features <- tumor_site_features %>%
+  mutate(across(where(is.numeric), ~ replace(., is.nan(.), NA))) %>%
+  mutate(across(where(is.numeric), ~ replace(., is.infinite(.), NA))) %>%
+  mutate(across(where(is.numeric), ~ replace_na(., 0)))
+
+dim(tumor_site_features)
+head(tumor_site_features)
+
+
+## =========================
+## Construct final analysis dataset
+## =========================
+analysis_final <- analysis_step4 %>%
+  left_join(progression_features, by = "PATIENT_ID") %>%
+  left_join(tumor_site_features, by = "PATIENT_ID")
+
+# NLP variables used in final model
+nlp_cols <- c(
+  "n_scans_progression",
+  "progression_prob_mean",
+  "progression_prob_max",
+  "progression_prob_min",
+  "progression_prob_sd",
+  "last_progression_prob",
+  "n_scans_sites",
+  "tumor_sites_mean",
+  "tumor_sites_max",
+  "tumor_sites_min",
+  "prop_scans_chest",
+  "prop_scans_abdomen",
+  "prop_scans_pelvis",
+  "prop_scans_head",
+  "prop_scans_other",
+  "any_head_site",
+  "any_abdomen_site",
+  "any_pelvis_site",
+  "any_other_site"
+)
+
+
+analysis_final <- analysis_final %>%
+  mutate(across(where(is.numeric), ~ replace(., is.nan(.), NA))) %>%
+  mutate(across(where(is.numeric), ~ replace(., is.infinite(.), NA))) %>%
+  mutate(across(where(is.numeric), ~ replace_na(., 0)))
+
+
+dim(analysis_final)
+head(analysis_final)
+
+
+analysis_final %>%
+  count(PATIENT_ID) %>%
+  summarise(
+    min_n = min(n),
+    max_n = max(n)
+  )
+
+
+colSums(is.na(analysis_final[, nlp_cols]))
+
+```
+
+
+
+```{r step6-fix-last-progression-prob, message=FALSE, warning=FALSE}
+
+
+analysis_final <- analysis_final %>%
+  mutate(
+    last_progression_prob = as.numeric(last_progression_prob),
+    last_progression_prob = ifelse(is.na(last_progression_prob), 0, last_progression_prob)
+  )
+
+
+summary(analysis_final$last_progression_prob)
+table(is.na(analysis_final$last_progression_prob))
+
+
+colSums(is.na(analysis_final))
+
+
+analysis_final %>%
+  count(PATIENT_ID) %>%
+  summarise(
+    min_n = min(n),
+    max_n = max(n)
+  )
+
+
+analysis_final %>%
+  select(
+    PATIENT_ID,
+    progression_prob_mean,
+    progression_prob_max,
+    progression_prob_min,
+    progression_prob_sd,
+    last_progression_prob,
+    n_scans_sites
+  ) %>%
+  head()
+```
+
+
+
+```{r step7-8-cox-modeling, message=FALSE, warning=FALSE}
+
+library(dplyr)
+library(survival)
+library(tidyr)
+library(ggplot2)
+
+## =========================
+## Define feature sets
+## =========================
+clinical_vars <- c(
+  "age",
+  "gender",
+  "stage"
+)
+
+genomic_vars <- c(
+  "mut_EGFR",
+  "mut_RBM10",
+  "mut_NF1",
+  "mut_STK11",
+  "mut_FAT1",
+  "mut_TP53",
+  "mut_KEAP1",
+  "mut_PTPRD",
+  "mut_KRAS",
+  "mut_SMARCA4"
+)
+
+nlp_vars <- c(
+  "n_scans_progression",
+  "progression_prob_mean",
+  "progression_prob_max",
+  "n_scans_sites",
+  "tumor_sites_mean",
+  "tumor_sites_max"
+)
+
+## =========================
+## Prepare modeling dataset
+## =========================
+cox_data <- analysis_final %>%
+  mutate(
+    gender = factor(gender),
+    stage = factor(stage)
+  )
+
+# survival object uses OS time from sequencing and event indicator
+surv_obj <- with(cox_data, Surv(OS_MONTHS, os_event))
+
+## =========================
+## Define formulas
+## =========================
+formula_m1 <- as.formula(
+  paste("Surv(OS_MONTHS, os_event) ~", paste(clinical_vars, collapse = " + "))
+)
+
+formula_m2 <- as.formula(
+  paste("Surv(OS_MONTHS, os_event) ~", paste(c(clinical_vars, genomic_vars), collapse = " + "))
+)
+
+formula_m3 <- as.formula(
+  paste("Surv(OS_MONTHS, os_event) ~", paste(c(clinical_vars, genomic_vars, nlp_vars), collapse = " + "))
+)
+
+## =========================
+## Fit Cox models
+## =========================
+model1_data <- cox_data %>%
+  select(OS_MONTHS, os_event, all_of(clinical_vars)) %>%
+  drop_na()
+
+model2_data <- cox_data %>%
+  select(OS_MONTHS, os_event, all_of(c(clinical_vars, genomic_vars))) %>%
+  drop_na()
+
+model3_data <- cox_data %>%
+  select(OS_MONTHS, os_event, all_of(c(clinical_vars, genomic_vars, nlp_vars))) %>%
+  drop_na()
+
+cox_m1 <- coxph(formula_m1, data = model1_data, x = TRUE)
+cox_m2 <- coxph(formula_m2, data = model2_data, x = TRUE)
+cox_m3 <- coxph(formula_m3, data = model3_data, x = TRUE)
+
+summary(cox_m1)
+summary(cox_m2)
+summary(cox_m3)
+
+## =========================
+## C-index comparison
+## =========================
+get_cindex <- function(model, model_name) {
+  s <- summary(model)
+  data.frame(
+    Model = model_name,
+    C_index = unname(s$concordance[1]),
+    SE = unname(s$concordance[2]),
+    Lower_95CI = unname(s$concordance[1] - 1.96 * s$concordance[2]),
+    Upper_95CI = unname(s$concordance[1] + 1.96 * s$concordance[2])
+  )
+}
+
+cindex_table <- bind_rows(
+  get_cindex(cox_m1, "Model 1: Clinical only"),
+  get_cindex(cox_m2, "Model 2: Clinical + Genomic"),
+  get_cindex(cox_m3, "Model 3: Clinical + Genomic + NLP")
+)
+
+cindex_table
+
+## =========================
+## HR table
+## =========================
+extract_hr_table <- function(model, model_name) {
+  s <- summary(model)
+  
+  coef_df <- as.data.frame(s$coefficients)
+  conf_df <- as.data.frame(s$conf.int)
+  
+  out <- data.frame(
+    Model = model_name,
+    Variable = rownames(coef_df),
+    HR = conf_df$`exp(coef)`,
+    Lower_95CI = conf_df$`lower .95`,
+    Upper_95CI = conf_df$`upper .95`,
+    P_value = coef_df$`Pr(>|z|)`,
+    row.names = NULL
+  )
+  
+  out
+}
+
+hr_table_m1 <- extract_hr_table(cox_m1, "Model 1")
+hr_table_m2 <- extract_hr_table(cox_m2, "Model 2")
+hr_table_m3 <- extract_hr_table(cox_m3, "Model 3")
+
+hr_table_all <- bind_rows(hr_table_m1, hr_table_m2, hr_table_m3)
+
+hr_table_all
+
+
+hr_table_m3
+
+## =========================
+## KM plot based on Model 3 risk groups
+## =========================
+# Use linear predictor from Model 3
+model3_data <- model3_data %>%
+  mutate(
+    risk_score = predict(cox_m3, type = "lp"),
+    risk_group = ntile(risk_score, 4)
+  ) %>%
+  mutate(
+    risk_group = factor(
+      risk_group,
+      levels = c(1, 2, 3, 4),
+      labels = c("Q1 (Lowest risk)", "Q2", "Q3", "Q4 (Highest risk)")
+    )
+  )
+
+km_fit_m3 <- survfit(Surv(OS_MONTHS, os_event) ~ risk_group, data = model3_data)
+
+plot(
+  km_fit_m3,
+  col = c("black", "blue", "orange", "red"),
+  lwd = 2,
+  xlab = "Months since sequencing",
+  ylab = "Overall survival probability",
+  main = "Kaplan-Meier Curves by Model 3 Risk Groups"
+)
+
+legend(
+  "bottomleft",
+  legend = levels(model3_data$risk_group),
+  col = c("black", "blue", "orange", "red"),
+  lwd = 2,
+  bty = "n"
+)
+
+## =========================
+## log-rank test for KM groups
+## =========================
+survdiff(Surv(OS_MONTHS, os_event) ~ risk_group, data = model3_data)
+
+```
+
+
+```{r cindex-table, message=FALSE, warning=FALSE}
+cindex_table %>%
+  mutate(
+    across(c(C_index, SE, Lower_95CI, Upper_95CI), round, 3)
+  )
+```
+
+
+
+
+```{r hr-table-model3, message=FALSE, warning=FALSE}
+hr_table_m3 %>%
+  mutate(
+    across(c(HR, Lower_95CI, Upper_95CI), round, 3),
+    P_value = signif(P_value, 3)
+  ) %>%
+  arrange(P_value)
+```
+
+
+
+
+```{r cox-forest-plot-final, message=FALSE, warning=FALSE}
+
+library(dplyr)
+library(ggplot2)
+library(stringr)
+
+forest_df <- hr_table_m3 %>%
+  
+  
+  filter(!is.na(HR)) %>%
+  
+  
+  mutate(
+    Variable = Variable %>%
+      str_replace("^mut_", "") %>%
+      str_replace("^genderMale$", "Male (vs Female)") %>%
+      str_replace("^genderUnknown$", "Unknown gender") %>%
+      str_replace("^stageStage 4$", "Stage 4 (vs Stage 1–3)") %>%
+      str_replace("^stageUnknown$", "Unknown stage") %>%
+      str_replace("^n_scans_progression$", "Number of progression scans") %>%
+      str_replace("^n_scans_sites$", "Number of tumor-site scans") %>%
+      str_replace("^tumor_sites_mean$", "Mean tumor sites per scan") %>%
+      str_replace("^tumor_sites_max$", "Maximum tumor sites per scan")
+  ) %>%
+  
+  
+  arrange(HR) %>%
+  
+  mutate(
+    Variable = factor(Variable, levels = Variable)
+  )
+
+ggplot(forest_df, aes(x = HR, y = Variable)) +
+  
+  geom_vline(xintercept = 1, linetype = "dashed", color = "gray50") +
+  
+  geom_errorbarh(
+    aes(xmin = Lower_95CI, xmax = Upper_95CI),
+    height = 0.25,
+    size = 0.8
+  ) +
+  
+  geom_point(size = 2.8) +
+  
+  scale_x_log10() +
+  
+  labs(
+    title = "Cox Model 3: Hazard Ratios with 95% CI",
+    x = "Hazard Ratio (log scale)",
+    y = NULL
+  ) +
+  
+  theme_bw(base_size = 14)
+```
+
+```{r phase1-clean-nlp-vars}
+# clean NLP feature set for final poster
+# Keep only stable NLP variables and exclude problematic progression probability variables
+
+nlp_vars_phase1 <- c(
+  "n_scans_progression",
+  "n_scans_sites",
+  "tumor_sites_mean",
+  "tumor_sites_max"
+)
+
+```
+
+
+
+```{r phase1-define-clean-model3}
+# Clean Model 3 formula for poster use
+formula_m3_phase1 <- as.formula(
+  paste(
+    "Surv(OS_MONTHS, os_event) ~",
+    paste(c(clinical_vars, genomic_vars, nlp_vars_phase1), collapse = " + ")
+  )
+)
+
+# Prepare modeling dataset for clean Model 3
+model3_data_phase1 <- cox_data %>%
+  select(OS_MONTHS, os_event, all_of(c(clinical_vars, genomic_vars, nlp_vars_phase1))) %>%
+  drop_na()
+
+```
+
+
+
+```{r phase1-fit-clean-model3}
+# Fit clean Cox Model 3
+cox_m3_phase1 <- coxph(formula_m3_phase1, data = model3_data_phase1, x = TRUE)
+
+summary(cox_m3_phase1)
+```
+
+
+
+```{r phase1-cindex-table}
+# Updated C-index table for poster
+cindex_table_phase1 <- bind_rows(
+  get_cindex(cox_m1, "Model 1: Clinical only"),
+  get_cindex(cox_m2, "Model 2: Clinical + Genomic"),
+  get_cindex(cox_m3_phase1, "Model 3: Clinical + Genomic + Clean NLP")
+)
+
+cindex_table_phase1
+```
+
+
+
+```{r phase1-cindex-table-rounded}
+cindex_table_phase1 %>%
+  mutate(
+    across(c(C_index, SE, Lower_95CI, Upper_95CI), round, 3)
+  )
+```
+
+
+
+```{r phase1-hr-table}
+# HR table for clean Model 3
+hr_table_m3_phase1 <- extract_hr_table(cox_m3_phase1, "Model 3 Phase 1")
+
+hr_table_m3_phase1
+```
+
+
+
+```{r phase1-hr-table-rounded}
+hr_table_m3_phase1 %>%
+  mutate(
+    across(c(HR, Lower_95CI, Upper_95CI), round, 3),
+    P_value = signif(P_value, 3)
+  ) %>%
+  arrange(P_value)
+```
+
+
+```{r phase1-km-plot, fig.width=8, fig.height=6}
+# KM plot based on clean Model 3 risk groups
+model3_data_phase1 <- model3_data_phase1 %>%
+  mutate(
+    risk_score = predict(cox_m3_phase1, type = "lp"),
+    risk_group = ntile(risk_score, 4)
+  ) %>%
+  mutate(
+    risk_group = factor(
+      risk_group,
+      levels = c(1, 2, 3, 4),
+      labels = c("Q1 (Lowest risk)", "Q2", "Q3", "Q4 (Highest risk)")
+    )
+  )
+
+km_fit_m3_phase1 <- survfit(Surv(OS_MONTHS, os_event) ~ risk_group, data = model3_data_phase1)
+
+plot(
+  km_fit_m3_phase1,
+  col = c("black", "blue", "orange", "red"),
+  lwd = 2,
+  xlab = "Months since sequencing",
+  ylab = "Overall survival probability",
+  main = "Kaplan-Meier Curves by Clean Model 3 Risk Groups"
+)
+
+legend(
+  "bottomleft",
+  legend = levels(model3_data_phase1$risk_group),
+  col = c("black", "blue", "orange", "red"),
+  lwd = 2,
+  bty = "n"
+)
+
+```
+
+
+
+```{r phase1-logrank}
+survdiff(Surv(OS_MONTHS, os_event) ~ risk_group, data = model3_data_phase1)
+```
+
+
+
+```{r phase1-forest-plot, fig.width=9, fig.height=7}
+library(stringr)
+
+forest_df_phase1 <- hr_table_m3_phase1 %>%
+  filter(!is.na(HR)) %>%
+  mutate(
+    Variable = Variable %>%
+      str_replace("^mut_", "") %>%
+      str_replace("^genderMale$", "Male (vs Female)") %>%
+      str_replace("^genderUnknown$", "Unknown gender") %>%
+      str_replace("^stageStage 4$", "Stage 4 (vs Stage 1–3)") %>%
+      str_replace("^stageUnknown$", "Unknown stage") %>%
+      str_replace("^n_scans_progression$", "Number of progression scans") %>%
+      str_replace("^n_scans_sites$", "Number of tumor-site scans") %>%
+      str_replace("^tumor_sites_mean$", "Mean tumor sites per scan") %>%
+      str_replace("^tumor_sites_max$", "Maximum tumor sites per scan")
+  ) %>%
+  arrange(HR) %>%
+  mutate(
+    Variable = factor(Variable, levels = Variable)
+  )
+
+ggplot(forest_df_phase1, aes(x = HR, y = Variable)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "gray50") +
+  geom_errorbarh(
+    aes(xmin = Lower_95CI, xmax = Upper_95CI),
+    width = 0.25,
+    size = 0.8
+  ) +
+  geom_point(size = 2.8) +
+  scale_x_log10() +
+  labs(
+    title = "Clean Cox Model 3: Hazard Ratios with 95% CI",
+    x = "Hazard Ratio (log scale)",
+    y = NULL
+  ) +
+  theme_bw(base_size = 14)
+
+```
+
+```{r rsf-load-packages}
+# install.packages("ranger")   
+library(ranger)
+library(survival)
+library(dplyr)
+library(ggplot2)
+
+```
+
+```{r rsf-module1-fit}
+
+rsf_data <- model3_data_phase1 %>%
+  select(
+    OS_MONTHS,
+    os_event,
+    age,
+    gender,
+    stage,
+    starts_with("mut_"),
+    n_scans_progression,
+    n_scans_sites,
+    tumor_sites_mean,
+    tumor_sites_max
+  )
+
+
+rsf_fit <- ranger(
+  formula = Surv(OS_MONTHS, os_event) ~ .,
+  data = rsf_data,
+  num.trees = 100,
+  mtry = floor(sqrt(ncol(rsf_data) - 2)),   
+  min.node.size = 15,
+  importance = "none",
+  splitrule = "logrank",
+  num.threads = 2,
+  seed = 629
+)
+
+rsf_fit
+```
+```{r rsf-module2-cindex}
+
+rsf_cindex <- data.frame(
+  Model = "RSF: Clinical + Genomic + Clean NLP",
+  C_index = 1 - rsf_fit$prediction.error,
+  SE = NA_real_,
+  Lower_95CI = NA_real_,
+  Upper_95CI = NA_real_
+)
+
+rsf_cindex
+```
+
+
+```{r rsf-module3-cindex-table}
+cindex_table_with_rsf <- bind_rows(
+  cindex_table_phase1,
+  rsf_cindex
+)
+
+cindex_table_with_rsf
+
+```
+
+```{r rsf-module4-importance-corrected, fig.width=8, fig.height=6}
+
+rsf_fit_imp <- ranger(
+  formula = Surv(OS_MONTHS, os_event) ~ .,
+  data = rsf_data,
+  num.trees = 100,
+  mtry = floor(sqrt(ncol(rsf_data) - 2)),
+  min.node.size = 15,
+  importance = "permutation",
+  splitrule = "logrank",
+  num.threads = 2,
+  seed = 629
+)
+
+
+rsf_importance_df <- data.frame(
+  Variable = names(rsf_fit_imp$variable.importance),
+  Importance = as.numeric(rsf_fit_imp$variable.importance)
+) %>%
+  arrange(desc(Importance))
+
+
+rsf_importance_top10 <- rsf_importance_df %>%
+  slice_head(n = 10)
+
+rsf_importance_top10
+
+
+ggplot(rsf_importance_top10,
+       aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Top 10 Variable Importance (RSF)",
+    x = NULL,
+    y = "Permutation Importance"
+  ) +
+  theme_bw(base_size = 14)
+```
+
+```{r xgb-module1-prepare}
+# install.packages("xgboost")   
+library(xgboost)
+
+
+
+xgb_data <- model3_data_phase1 %>%
+  select(
+    OS_MONTHS,
+    os_event,
+    age,
+    gender,
+    stage,
+    starts_with("mut_"),
+    n_scans_progression,
+    n_scans_sites,
+    tumor_sites_mean,
+    tumor_sites_max
+  )
+
+
+xgb_x <- xgb_data %>%
+  select(-OS_MONTHS, -os_event)
+
+
+xgb_matrix <- model.matrix(~ . - 1, data = xgb_x)
+
+
+xgb_label <- ifelse(xgb_data$os_event == 1, xgb_data$OS_MONTHS, -xgb_data$OS_MONTHS)
+
+
+dtrain <- xgb.DMatrix(
+  data = xgb_matrix,
+  label = xgb_label
+)
+
+dim(xgb_matrix)
+head(colnames(xgb_matrix))
+summary(xgb_label)
+```
+
+
+
+```{r xgb-module2-fit}
+params <- list(
+  objective = "survival:cox",
+  eval_metric = "cox-nloglik",
+  eta = 0.05,
+  max_depth = 3,
+  min_child_weight = 10,
+  subsample = 0.8,
+  colsample_bynode = 0.8
+)
+
+xgb_fit <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 100,
+  verbose = 0
+)
+
+xgb_fit
+
+```
+
+
+
+```{r xgb-module3-cindex}
+# install.packages("Hmisc")
+library(Hmisc)
+
+
+xgb_pred <- predict(xgb_fit, newdata = dtrain)
+
+summary(xgb_pred)
+
+
+xgb_rcorr <- rcorr.cens(-xgb_pred, Surv(xgb_data$OS_MONTHS, xgb_data$os_event))
+
+xgb_cindex <- data.frame(
+  Model = "XGB: Clinical + Genomic + Clean NLP",
+  C_index = as.numeric(xgb_rcorr["C Index"]),
+  SE = as.numeric(xgb_rcorr["S.D."]) / sqrt(length(xgb_pred)),
+  Lower_95CI = as.numeric(xgb_rcorr["C Index"]) - 1.96 * as.numeric(xgb_rcorr["S.D."]) / sqrt(length(xgb_pred)),
+  Upper_95CI = as.numeric(xgb_rcorr["C Index"]) + 1.96 * as.numeric(xgb_rcorr["S.D."]) / sqrt(length(xgb_pred))
+)
+
+xgb_cindex
+
+```
+
+```{r xgb-module3-check}
+xgb_rcorr
+names(xgb_rcorr)
+
+```
+```{r xgb-module4-xgb-cindex-table}
+xgb_cindex <- data.frame(
+  Model = "XGB: Clinical + Genomic + Clean NLP",
+  C_index = as.numeric(xgb_rcorr["C Index"]),
+  SE = as.numeric(xgb_rcorr["S.D."]) / sqrt(length(xgb_pred)),
+  Lower_95CI = as.numeric(xgb_rcorr["C Index"]) -
+    1.96 * as.numeric(xgb_rcorr["S.D."]) / sqrt(length(xgb_pred)),
+  Upper_95CI = as.numeric(xgb_rcorr["C Index"]) +
+    1.96 * as.numeric(xgb_rcorr["S.D."]) / sqrt(length(xgb_pred))
+)
+
+xgb_cindex
+```
+
+
+
+```{r xgb-module5-final-table}
+cindex_table_final <- bind_rows(
+  cindex_table_phase1,
+  rsf_cindex,
+  xgb_cindex
+)
+
+cindex_table_final
+```
+
+
+```{r xgb-module6-final-table-rounded}
+poster_cindex_table <- cindex_table_final %>%
+  mutate(
+    across(c(C_index, SE, Lower_95CI, Upper_95CI), ~ round(.x, 3))
+  )
+
+poster_cindex_table
+```
+
+
+
+```{r xgb-module7-final-plot, fig.width=10, fig.height=6}
+plot_df <- poster_cindex_table %>%
+  mutate(
+    Model = factor(
+      Model,
+      levels = c(
+        "Model 1: Clinical only",
+        "Model 2: Clinical + Genomic",
+        "Model 3: Clinical + Genomic + Clean NLP",
+        "RSF: Clinical + Genomic + Clean NLP",
+        "XGB: Clinical + Genomic + Clean NLP"
+      )
+    )
+  )
+
+ggplot(plot_df, aes(x = Model, y = C_index)) +
+  geom_errorbar(
+    aes(ymin = Lower_95CI, ymax = Upper_95CI),
+    width = 0.12,
+    linewidth = 1.2,
+    na.rm = TRUE
+  ) +
+  geom_point(size = 3.2) +
+  geom_text(
+    aes(label = sprintf("%.3f", C_index)),
+    vjust = -0.9,
+    size = 4.5
+  ) +
+  scale_y_continuous(
+    limits = c(0.64, 0.75),
+    breaks = seq(0.64, 0.75, by = 0.02),
+    expand = expansion(mult = c(0.01, 0.03))
+  ) +
+  labs(
+    title = "Model Comparison by C-index",
+    x = NULL,
+    y = "C-index"
+  ) +
+  theme_bw(base_size = 15) +
+  theme(
+    axis.text.x = element_text(angle = 25, hjust = 1),
+    plot.title = element_text(face = "bold")
+  )
+```
+
+```{r xgb-shap-module1}
+
+shap_values <- predict(
+  xgb_fit,
+  newdata = dtrain,
+  predcontrib = TRUE
+)
+
+dim(shap_values)
+```
+
+
+```{r xgb-shap-module2}
+
+shap_df <- as.data.frame(shap_values)
+
+
+shap_df <- shap_df[, colnames(shap_df) != "BIAS", drop = FALSE]
+
+
+mean_abs_shap <- data.frame(
+  Variable = colnames(shap_df),
+  MeanAbsSHAP = colMeans(abs(shap_df))
+) %>%
+  arrange(desc(MeanAbsSHAP))
+
+
+mean_abs_shap_top10 <- mean_abs_shap %>%
+  slice_head(n = 10)
+
+mean_abs_shap_top10
+```
+
+
+
+```{r xgb-shap-module3, fig.width=8, fig.height=6}
+
+
+mean_abs_shap_top10_pretty <- mean_abs_shap_top10 %>%
+  mutate(
+    Variable_pretty = recode(
+      Variable,
+
+      "stageStage 4" = "Stage IV",
+      "stageUnknown" = "Stage Unknown",
+
+      "genderFemale" = "Female",
+      "genderMale" = "Male",
+      "genderUnknown" = "Gender Unknown",
+
+      "tumor_sites_max" = "Max Tumor Sites",
+      "tumor_sites_mean" = "Mean Tumor Sites",
+
+      "n_scans_sites" = "Scans with Sites",
+      "n_scans_progression" = "Scans with Progression",
+
+      "mut_TP53" = "TP53 Mutation",
+      "mut_EGFR" = "EGFR Mutation",
+      "mut_KEAP1" = "KEAP1 Mutation",
+      "mut_STK11" = "STK11 Mutation",
+      "mut_KRAS" = "KRAS Mutation",
+
+      "age" = "Age",
+
+      .default = Variable
+    )
+  )
+
+mean_abs_shap_top10_pretty %>%
+  select(Variable = Variable_pretty, MeanAbsSHAP)
+
+
+ggplot(mean_abs_shap_top10_pretty,
+       aes(x = reorder(Variable_pretty, MeanAbsSHAP),
+           y = MeanAbsSHAP)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Top 10 Features by Mean Absolute SHAP (XGB)",
+    x = NULL,
+    y = "Mean |SHAP value|"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+
+```{r session-info}
+sessionInfo()
+```
+
