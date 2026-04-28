@@ -1,11 +1,15 @@
-# BIOS 629 Final Project
+# My Project
+
+
+MSK-CHORD • 2026
+
 
 ## Machine Learning Improves Survival Prediction in NSCLC
 
 Ruicong Peng  
 University of Michigan
 
-## Project Summary
+# Project Summary
 
 This project evaluates whether machine learning models improve survival prediction in non-small cell lung cancer (NSCLC) by integrating:
 
